@@ -1420,8 +1420,7 @@ function pickMime(){
   if(typeof MediaRecorder==='undefined')return null;
   return c.map(([type,ext])=>({type,ext})).find(m=>MediaRecorder.isTypeSupported(m.type))||null;
 }
-function startRecording(){
-  if(rec){rec.cancelled=true;try{rec.mr.stop()}catch(e){}return}
+function startRecordingLive(){
   const mime=pickMime();
   if(!mime||!cv.captureStream){toast('This browser cannot record video. Try Chrome or Edge.');return}
   ensureLayout();
@@ -1438,6 +1437,121 @@ function startRecording(){
   };
   S.playing=true;S.t=0;mr.start(200);
   toast('Recording one loop. Keep this tab visible until it finishes.');
+}
+
+/* ---------- offline video export: frame-by-frame, independent of how fast the screen can play ---------- */
+const cat=a=>{let n=0;for(const x of a)n+=x.length;const o=new Uint8Array(n);let p=0;for(const x of a){o.set(x,p);p+=x.length}return o};
+const b32=n=>new Uint8Array([n>>>24&255,n>>>16&255,n>>>8&255,n&255]),b16=n=>new Uint8Array([n>>8&255,n&255]);
+const bstr=s=>new Uint8Array([...s].map(c=>c.charCodeAt(0))),zeros=n=>new Uint8Array(n);
+const mbox=(t,...p)=>{const d=cat(p);return cat([b32(d.length+8),bstr(t),d])};
+const mfull=(t,v,f,...p)=>mbox(t,new Uint8Array([v,f>>16&255,f>>8&255,f&255]),...p);
+function muxMP4(ch,desc,w,h,fps){
+  const TS=90000,delta=Math.round(TS/fps),n=ch.length,dur=n*delta;
+  const mat=cat([0x10000,0,0,0,0x10000,0,0,0,0x40000000].map(b32));
+  const keys=[];ch.forEach((c,i)=>{if(c.key)keys.push(i+1)});
+  const moov=off=>mbox('moov',
+    mfull('mvhd',0,0,b32(0),b32(0),b32(TS),b32(dur),b32(0x10000),b16(0x100),zeros(10),mat,zeros(24),b32(2)),
+    mbox('trak',
+      mfull('tkhd',0,3,b32(0),b32(0),b32(1),b32(0),b32(dur),zeros(8),b16(0),b16(0),b16(0),b16(0),mat,b32(w*65536),b32(h*65536)),
+      mbox('mdia',
+        mfull('mdhd',0,0,b32(0),b32(0),b32(TS),b32(dur),b16(0x55c4),b16(0)),
+        mfull('hdlr',0,0,b32(0),bstr('vide'),zeros(12),bstr('VideoHandler\0')),
+        mbox('minf',
+          mfull('vmhd',0,1,zeros(8)),
+          mbox('dinf',mfull('dref',0,0,b32(1),mfull('url ',0,1))),
+          mbox('stbl',
+            mfull('stsd',0,0,b32(1),mbox('avc1',zeros(6),b16(1),zeros(16),b16(w),b16(h),b32(0x480000),b32(0x480000),b32(0),b16(1),zeros(32),b16(0x18),b16(0xffff),mbox('avcC',desc))),
+            mfull('stts',0,0,b32(1),b32(n),b32(delta)),
+            mfull('stss',0,0,b32(keys.length),...keys.map(b32)),
+            mfull('stsc',0,0,b32(1),b32(1),b32(n),b32(1)),
+            mfull('stsz',0,0,b32(0),b32(n),...ch.map(c=>b32(c.data.length))),
+            mfull('stco',0,0,b32(1),b32(off)))))));
+  const ftyp=mbox('ftyp',bstr('isom'),b32(512),bstr('isom'),bstr('iso2'),bstr('avc1'),bstr('mp41'));
+  const size=ch.reduce((a,c)=>a+c.data.length,0),m0=moov(0);
+  const m=moov(ftyp.length+m0.length+8);
+  return new Blob([ftyp,m,b32(size+8),bstr('mdat'),...ch.map(c=>c.data)],{type:'video/mp4'});
+}
+function muxWebM(ch,codecId,w,h,fps){
+  const size8=n=>new Uint8Array([1,0,0,0,n>>>24&255,n>>>16&255,n>>>8&255,n&255]);
+  const el=(id,p)=>cat([new Uint8Array(id),size8(p.length),p]);
+  const uint=n=>{const a=[];do{a.unshift(n&255);n=Math.floor(n/256)}while(n>0);return new Uint8Array(a)};
+  const f64=x=>{const b=new Uint8Array(8);new DataView(b.buffer).setFloat64(0,x);return b};
+  const U=10000,total=ch.length/fps; /* timecode unit = 0.1 ms */
+  const ebml=el([0x1A,0x45,0xDF,0xA3],cat([el([0x42,0x86],uint(1)),el([0x42,0xF7],uint(1)),el([0x42,0xF2],uint(4)),el([0x42,0xF3],uint(8)),el([0x42,0x82],bstr('webm')),el([0x42,0x87],uint(4)),el([0x42,0x85],uint(2))]));
+  const info=el([0x15,0x49,0xA9,0x66],cat([el([0x2A,0xD7,0xB1],uint(100000)),el([0x44,0x89],f64(total*U)),el([0x4D,0x80],bstr('Grid Animator')),el([0x57,0x41],bstr('Grid Animator'))]));
+  const tracks=el([0x16,0x54,0xAE,0x6B],el([0xAE],cat([el([0xD7],uint(1)),el([0x73,0xC5],uint(1)),el([0x83],uint(1)),el([0x86],bstr(codecId)),el([0xE0],cat([el([0xB0],uint(w)),el([0xBA],uint(h))]))])));
+  const clusters=[];
+  for(let s=0;s<ch.length;s+=Math.max(1,Math.round(fps))){
+    const tc=Math.round(s*U/fps),blocks=[el([0xE7],uint(tc))];
+    for(let i=s;i<Math.min(ch.length,s+Math.max(1,Math.round(fps)));i++){
+      const rel=Math.round(i*U/fps)-tc;
+      blocks.push(el([0xA3],cat([new Uint8Array([0x81]),b16(rel),new Uint8Array([ch[i].key?0x80:0]),ch[i].data])));
+    }
+    clusters.push(el([0x1F,0x43,0xB6,0x75],cat(blocks)));
+  }
+  return new Blob([ebml,el([0x18,0x53,0x80,0x67],cat([info,tracks,...clusters]))],{type:'video/webm'});
+}
+const yieldNow=()=>new Promise(res=>{const c=new MessageChannel();c.port1.onmessage=()=>res();c.port2.postMessage(0)});
+async function pickEncoder(w,h,fps,bitrate){
+  const tryList=[
+    {codec:'avc1.640034',kind:'mp4',avc:{format:'avc'}},{codec:'avc1.4D0034',kind:'mp4',avc:{format:'avc'}},{codec:'avc1.42003E',kind:'mp4',avc:{format:'avc'}},
+    {codec:'vp09.00.51.08',kind:'webm',id:'V_VP9'},{codec:'vp8',kind:'webm',id:'V_VP8'}];
+  for(const c of tryList){
+    const ew=c.kind==='mp4'?w&~1:w,eh=c.kind==='mp4'?h&~1:h;
+    const cfg={codec:c.codec,width:ew,height:eh,bitrate,framerate:fps,latencyMode:'quality'};
+    if(c.avc)cfg.avc=c.avc;
+    try{const s=await VideoEncoder.isConfigSupported(cfg);if(s&&s.supported)return {...c,cfg:s.config||cfg,ew,eh}}catch(e){}
+  }
+  return null;
+}
+async function startRecording(){
+  if(rec){rec.cancelled=true;if(rec.mr)try{rec.mr.stop()}catch(e){}return}
+  if(typeof VideoEncoder==='undefined'||typeof VideoFrame==='undefined')return startRecordingLive();
+  ensureLayout();
+  const fps=P.fps,D=P.duration,N=Math.max(1,Math.round(D*fps)),bitrate=Math.min(80e6,Math.round(W*H*fps*0.25));
+  const r={offline:true,cancelled:false};rec=r;lockUI(true);setVideoBtn(0);
+  const prevT=S.t,prevPlay=S.playing;S.playing=false;
+  let enc=null;
+  try{
+    const pick=await pickEncoder(W,H,fps,bitrate);
+    if(!pick){rec=null;S.playing=prevPlay;setVideoBtn();return startRecordingLive()}
+    const chunks=[];let desc=null,err=null;
+    enc=new VideoEncoder({
+      output:(c,meta)=>{
+        const d=meta&&meta.decoderConfig&&meta.decoderConfig.description;
+        if(d&&!desc)desc=d instanceof ArrayBuffer?new Uint8Array(d.slice(0)):new Uint8Array(d.buffer.slice(d.byteOffset,d.byteOffset+d.byteLength));
+        const buf=new Uint8Array(c.byteLength);c.copyTo(buf);chunks.push({data:buf,key:c.type==='key'});
+      },
+      error:e=>{err=e}
+    });
+    enc.configure(pick.cfg);
+    toast('Rendering video frame by frame. It stays exact even if the preview feels slow.');
+    const gop=Math.max(1,Math.round(fps*2));
+    for(let i=0;i<N;i++){
+      if(r.cancelled)break;
+      if(err)throw err;
+      while(enc.encodeQueueSize>8){await yieldNow();if(err)throw err}
+      S.t=i/fps;render(S.t);
+      const init={timestamp:Math.round(i*1e6/fps),duration:Math.round(1e6/fps)};
+      if(pick.ew!==W||pick.eh!==H)init.visibleRect={x:0,y:0,width:pick.ew,height:pick.eh};
+      const vf=new VideoFrame(cv,init);
+      enc.encode(vf,{keyFrame:i%gop===0});vf.close();
+      setVideoBtn(Math.round((i+1)/N*100));
+      if(i%3===2)await yieldNow();
+    }
+    if(!r.cancelled){await enc.flush();if(err)throw err}
+    try{enc.close()}catch(e){}enc=null;
+    if(r.cancelled){toast('Recording cancelled');return}
+    if(!chunks.length)throw new Error('no frames were encoded');
+    const blob=pick.kind==='mp4'?muxMP4(chunks,desc,pick.ew,pick.eh,fps):muxWebM(chunks,pick.id,pick.ew,pick.eh,fps);
+    rec=null;setVideoBtn();
+    await saveBlob(blob,`grid-animator-${P.preset}-${W}x${H}.${pick.kind}`);
+  }catch(e){
+    toast('Could not render the video: '+((e&&e.message)||'unknown error'));
+  }finally{
+    if(enc)try{enc.close()}catch(e){}
+    rec=null;setVideoBtn();S.t=prevT;S.playing=prevPlay;lastTs=performance.now();render(S.t);
+  }
 }
 function lockUI(on){
   document.body.classList.toggle('recording',on);
@@ -1459,6 +1573,7 @@ const qt=t=>Math.floor(t*P.fps+1e-6)/P.fps;
 function frame(now){
   const dt=Math.min(0.1,(now-lastTs)/1000);lastTs=now;
   const D=P.duration;
+  if(rec&&rec.offline){updateTransport();requestAnimationFrame(frame);return}
   if(rec){
     const el2=(now-rec.start)/1000;
     if(el2>=D){
