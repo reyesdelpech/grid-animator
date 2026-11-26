@@ -1687,14 +1687,23 @@ if(document.fonts&&document.fonts.load)Promise.all([document.fonts.load("700 24p
   const MIN_W=1024,MIN_H=600,SHARE_URL='https://reyesdelpech.github.io/grid-animator/'; /* update if the tool moves to another address */
   const el=$('small'),KEY='gridAnimatorSmallOk';
   let ok=false;try{ok=sessionStorage.getItem(KEY)==='1'}catch(e){}
-  const small=()=>innerWidth<MIN_W||innerHeight<MIN_H;
-  let was=false;
+  const vw=()=>Math.max(innerWidth||0,document.documentElement.clientWidth||0),vh=()=>Math.max(innerHeight||0,document.documentElement.clientHeight||0);
+  const small=()=>vw()<MIN_W||vh()<MIN_H;
+  let was=false,timer=0;
   function check(){
     const show=small()&&!ok;
-    $('smallNow').textContent=`${innerWidth} × ${innerHeight} px`;
+    $('smallNow').textContent=`${vw()} × ${vh()} px`;
     el.classList.toggle('on',show);
-    if(was&&!show&&window.gaTourMaybe)window.gaTourMaybe();
+    if(!show&&window.gaTourMaybe)window.gaTourMaybe();
     was=show;
+  }
+  /* A refresh can report a too-small window for a moment while the browser lays out the page.
+     So we only judge once the size has held steady, and only clearly tiny screens (phones) are shown instantly. */
+  function settle(){
+    clearTimeout(timer);
+    let last=vw()+'x'+vh();
+    const poll=()=>{const now=vw()+'x'+vh();if(now===last)check();else{last=now;timer=setTimeout(poll,250)}};
+    timer=setTimeout(poll,350);
   }
   $('smallUrl').value=SHARE_URL;
   $('smallGo').addEventListener('click',()=>{ok=true;try{sessionStorage.setItem(KEY,'1')}catch(e){}check()});
@@ -1705,8 +1714,10 @@ if(document.fonts&&document.fonts.load)Promise.all([document.fonts.load("700 24p
     $('smallCopy').textContent=done?'Copied':'Select and copy';
     if(!done){f.focus();f.select()}
   });
-  addEventListener('resize',check);addEventListener('orientationchange',()=>setTimeout(check,200));
-  check();
+  addEventListener('resize',()=>{if(el.classList.contains('on')&&!small())check();else settle()});
+  addEventListener('orientationchange',settle);addEventListener('load',settle);
+  if(window.visualViewport)visualViewport.addEventListener('resize',settle);
+  if(vw()<700)check();else settle();
 })();
 
 </script>
